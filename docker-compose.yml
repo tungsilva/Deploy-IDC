@@ -1,0 +1,245 @@
+# Bizfly Server Monitor — chạy Core từ image trên Docker Hub.
+#
+# Cách dùng (giống mọi dự án mã nguồn mở chạy bằng Docker):
+#
+#   1. Đặt tệp này và .env (chép từ .env.example, điền vài dòng) vào một thư mục.
+#   2. docker compose up -d
+#   3. Mở https://<CORE_EXTERNAL_HOST>:8443/  — đăng nhập bằng ADMIN_EMAIL/ADMIN_PASSWORD.
+#
+# Lần đầu, compose tự làm hết: kéo image, sinh chứng chỉ TLS (service certs),
+# dựng CSDL + tài khoản quản trị (migrate), phát runtime cho worker node (runtime).
+#
+# Nâng cấp:  đổi MH_VERSION trong .env  →  docker compose up -d
+#   Compose tự kéo đúng những image còn thiếu (bốn image của bản mới), migrate,
+#   rồi chỉ tạo lại các service ứng dụng — postgres/redis giữ nguyên.
+#   (Dùng MH_VERSION=latest thì phải `docker compose pull` trước.)
+#   Sao lưu trước khi nâng cấp:
+#   docker compose exec postgres sh -c 'pg_dump -U "$POSTGRES_USER" -Fc "$POSTGRES_DB"' > backup-$(date +%F).dump
+#
+# KHÔNG BAO GIỜ `docker compose down -v` — cờ -v xoá sạch CSDL và chứng chỉ.
+
+name: ${COMPOSE_PROJECT_NAME:-monitor-hardware}
+
+x-logging: &logging
+  # Giới hạn log: Docker mặc định giữ log mãi, đủ để đầy đĩa ở fleet lớn.
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+# Biến môi trường chung của các service ứng dụng. Phần thiết yếu đặt ở đây
+# (kèm thông báo nếu thiếu); mọi biến tinh chỉnh khác thêm thẳng vào .env.
+x-app-env: &app-env
+  NODE_ENV: production
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ${POSTGRES_USER:-monitor}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Đặt POSTGRES_PASSWORD trong .env}
+  POSTGRES_DB: ${POSTGRES_DB:-monitor_hardware}
+  REDIS_URL: redis://:${REDIS_PASSWORD:?Đặt REDIS_PASSWORD trong .env}@redis:6379
+  JWT_SECRET: ${JWT_SECRET:?Đặt JWT_SECRET trong .env}
+  BMC_CREDENTIALS_ENCRYPTION_KEY: ${BMC_CREDENTIALS_ENCRYPTION_KEY:?Đặt BMC_CREDENTIALS_ENCRYPTION_KEY trong .env}
+  CORE_EXTERNAL_HOST: ${CORE_EXTERNAL_HOST:?Đặt CORE_EXTERNAL_HOST trong .env}
+  REGISTRY: ${MH_REGISTRY:?Đặt MH_REGISTRY trong .env}
+  # Không ai trong ứng dụng đọc biến này — nó ở đây để ĐỔI SAN (thêm VIP của
+  # Worker Group) thì `up -d` tạo lại api và chúng nạp chứng chỉ mới mà
+  # service certs vừa sinh.
+  CERT_EXTRA_SANS: ${CERT_EXTRA_SANS:-}
+  API_PORT: "3000"
+  WORKER_HEALTH_PORT: "3001"
+
+x-app: &app
+  logging: *logging
+  restart: unless-stopped
+  env_file: .env
+  environment: *app-env
+
+services:
+  postgres:
+    image: timescale/timescaledb:2.29.1-pg16
+    logging: *logging
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-monitor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Đặt POSTGRES_PASSWORD trong .env}
+      POSTGRES_DB: ${POSTGRES_DB:-monitor_hardware}
+    # Mặc định hợp máy 8 vCPU/16 GB; chỉnh theo cỡ máy bằng các biến PG_* trong .env.
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=timescaledb
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-300}
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-1GB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-4GB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-512MB}
+      - -c
+      - max_wal_size=${PG_MAX_WAL_SIZE:-4GB}
+      - -c
+      - synchronous_commit=${PG_SYNCHRONOUS_COMMIT:-on}
+      - -c
+      - max_worker_processes=${PG_MAX_WORKER_PROCESSES:-32}
+      - -c
+      - timescaledb.max_background_workers=${PG_TS_BACKGROUND_WORKERS:-16}
+    shm_size: ${PG_SHM_SIZE:-1g}
+    ports:
+      # Chỉ loopback, trừ khi có worker node ở máy khác (đặt IP mạng riêng của Core).
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PUBLISHED_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    logging: *logging
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Đặt REDIS_PASSWORD trong .env}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ['exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"']
+    ports:
+      - "${REDIS_BIND_ADDRESS:-127.0.0.1}:${REDIS_PUBLISHED_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", 'redis-cli -a "$$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Ba việc chạy một lần mỗi lần `up`, rồi thoát ──────────────────────
+  # Sinh chứng chỉ TLS nếu chưa có. Muốn dùng chứng chỉ của riêng bạn: đặt
+  # server.crt, server.key, ca.crt vào volume certs (xem README) — có rồi thì
+  # service này giữ nguyên.
+  certs:
+    image: ${MH_REGISTRY:?Đặt MH_REGISTRY trong .env}monitor-hardware-api:${MH_VERSION:-latest}
+    logging: *logging
+    command: ["mh-gen-certs"]
+    environment:
+      CORE_EXTERNAL_HOST: ${CORE_EXTERNAL_HOST:?Đặt CORE_EXTERNAL_HOST trong .env}
+      CERT_EXTRA_SANS: ${CERT_EXTRA_SANS:-}
+    volumes:
+      - certs:/certs
+      - certs_ca:/ca
+    restart: "no"
+
+  # Dựng/nâng lược đồ CSDL; tạo tài khoản quản trị đầu tiên từ ADMIN_EMAIL/
+  # ADMIN_PASSWORD (chỉ tạo, không bao giờ đặt lại mật khẩu đã có).
+  migrate:
+    image: ${MH_REGISTRY:?Đặt MH_REGISTRY trong .env}monitor-hardware-api:${MH_VERSION:-latest}
+    logging: *logging
+    env_file: .env
+    environment: *app-env
+    command: ["node", "dist/apps/migrate/main.js"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Phát runtime của bản worker này cho worker node ở các site — node tự cập
+  # nhật trong ~2 phút sau mỗi lần nâng cấp Core.
+  runtime:
+    image: ${MH_REGISTRY:?Đặt MH_REGISTRY trong .env}monitor-hardware-worker:${MH_VERSION:-latest}
+    logging: *logging
+    command: ["mh-publish-runtime"]
+    volumes:
+      - worker_runtime_data:/data/worker-runtime
+    restart: "no"
+
+  # ── Ứng dụng ──────────────────────────────────────────────────────────
+  api:
+    <<: *app
+    image: ${MH_REGISTRY:?Đặt MH_REGISTRY trong .env}monitor-hardware-api:${MH_VERSION:-latest}
+    environment:
+      <<: *app-env
+      TLS_CERT_PATH: /certs/server.crt
+      TLS_KEY_PATH: /certs/server.key
+      TLS_CA_PATH: /certs/ca.crt
+    ports:
+      # HTTPS — agent và worker node gọi vào đây.
+      - "${API_BIND_ADDRESS:-0.0.0.0}:${API_PUBLISHED_PORT:-3000}:3000"
+    volumes:
+      - certs:/certs:ro
+      - agent_tools_data:/data/agent-tools
+      - worker_runtime_data:/data/worker-runtime
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      certs: { condition: service_completed_successfully }
+      migrate: { condition: service_completed_successfully }
+      runtime: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "NODE_TLS_REJECT_UNAUTHORIZED=0 node -e \"fetch('https://127.0.0.1:3000/health/live').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+
+  worker:
+    <<: *app
+    image: ${MH_REGISTRY:?Đặt MH_REGISTRY trong .env}monitor-hardware-worker:${MH_VERSION:-latest}
+    volumes:
+      - agent_tools_data:/data/agent-tools:ro
+    deploy:
+      replicas: ${WORKER_REPLICAS:-7}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+
+  ml:
+    <<: *app
+    image: ${MH_REGISTRY:?Đặt MH_REGISTRY trong .env}monitor-hardware-ml:${MH_VERSION:-latest}
+    environment:
+      <<: *app-env
+      ML_THREADS: ${ML_THREADS:-2}
+    volumes:
+      - ml_models_data:/data/models
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+
+  web:
+    image: ${MH_REGISTRY:?Đặt MH_REGISTRY trong .env}monitor-hardware-web:${MH_VERSION:-latest}
+    logging: *logging
+    restart: unless-stopped
+    ports:
+      # Chỉ HTTPS.
+      - "${WEB_BIND_ADDRESS:-0.0.0.0}:${WEB_PORT:-8443}:8443"
+    environment:
+      # Như ở api: đổi SAN thì web được tạo lại và nạp chứng chỉ mới.
+      CORE_EXTERNAL_HOST: ${CORE_EXTERNAL_HOST:?Đặt CORE_EXTERNAL_HOST trong .env}
+      CERT_EXTRA_SANS: ${CERT_EXTRA_SANS:-}
+    volumes:
+      - certs:/etc/nginx/certs:ro
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --no-check-certificate https://127.0.0.1:8443/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
+  certs:          # server.crt, server.key, ca.crt — api và web đọc
+  certs_ca:       # khoá CA — CHỈ service certs đọc. Sao lưu nó: mất là phải cài lại mọi agent.
+  agent_tools_data:
+  ml_models_data:
+  worker_runtime_data:

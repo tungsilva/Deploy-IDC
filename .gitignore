@@ -1,0 +1,9 @@
+# Mật khẩu, khoá mã hoá — KHÔNG BAO GIỜ commit.
+.env
+# Chỉnh riêng cho máy này (compose tự gộp tệp này) — để `git pull` không đụng.
+docker-compose.override.yml
+# Bản sao lưu CSDL, khoá CA, kho công cụ agent (có giấy phép riêng).
+*.dump
+*.backup
+ca.key*
+agent-tools.tgz
