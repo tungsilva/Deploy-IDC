@@ -91,6 +91,21 @@ Thiếu công cụ nào thì mất phần dữ liệu tương ứng:
 | StorCLI | Không có dữ liệu RAID LSI/Dell trên máy không tải được MegaCLI. |
 | SMCIPMITool | Máy Supermicro đặt giao thức SMCIPMI không poll được; chuyển sang Redfish/IPMI. |
 
+## Chẩn đoán BMC không kết nối được (iLO / iDRAC)
+
+Máy hiện `unreachable` / `auth_error` mà không rõ vì sao:
+
+```bash
+sudo bash tools/diagnose-bmc.sh <IP-của-iLO>
+```
+
+Script hỏi tài khoản iLO (Enter để bỏ qua; mật khẩu không ghi vào báo cáo),
+rồi thử từ BÊN TRONG container worker: mạng, bắt tay TLS (cấu hình hiện tại và
+cấu hình cho firmware cũ), Redfish theo đúng đường quét của hệ thống, IPMI, và
+gom lỗi thật trong log worker. Sai mật khẩu thì dừng sau một lần để không khoá
+tài khoản. Báo cáo lưu ở `./bmc-diag-<ip>-<thời-gian>.txt`. Máy thuộc worker
+group thì chạy trên node của group đó.
+
 ## Những gì KHÔNG nằm trong image
 
 | Thứ | Ở site mới |
