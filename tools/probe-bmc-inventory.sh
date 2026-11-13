@@ -48,7 +48,7 @@ const WANT = /PCIe|Network|Ethernet|Storage|Adapter|Port|Slot|Function|Oem|Contr
 const SKIP = /LogServices|Sensors|Thermal|Power|Memory|Processors|Drives|Volumes|Bios|SecureBoot|Session|Account|EventService|JsonSchemas|Registries|UpdateService|TaskService|CertificateService|\$metadata|odata|Enclosure|SmcNodeManager|VirtualMedia|SerialInterfaces|NetworkProtocol|LogEntry|Assembly/i;
 const FIELDS = ['Id', 'Name', 'Description', 'Model', 'Manufacturer', 'PartNumber', 'SerialNumber', 'SKU',
   'FirmwareVersion', 'DeviceType', 'ClassCode', 'VendorId', 'DeviceId', 'MACAddress', 'PermanentMACAddress',
-  'SpeedMbps', 'LinkStatus', 'InterfaceEnabled', 'Status', 'SlotType', 'Lanes', 'PCIeType', 'Location', 'RedfishVersion'];
+  'SpeedMbps', 'LinkStatus', 'InterfaceEnabled', 'AssociatedNetworkAddresses', 'PhysicalPortNumber', 'Status', 'SlotType', 'Lanes', 'PCIeType', 'Location', 'RedfishVersion'];
 
 (async () => {
   const env = process.env;
@@ -104,7 +104,7 @@ const FIELDS = ['Id', 'Name', 'Description', 'Model', 'Manufacturer', 'PartNumbe
     const o = {};
     for (const k of FIELDS) if (j[k] !== undefined && j[k] !== null && j[k] !== '') o[k] = j[k];
     if (Array.isArray(j.Members)) o.Members = j.Members.length;
-    if (j.Links) o.LinksKeys = Object.keys(j.Links);
+    if (j.Links) o.Links = JSON.stringify(j.Links).slice(0, 400);
     if (j.Oem) o.Oem = JSON.stringify(j.Oem).slice(0, 400);
     if (Array.isArray(j.Controllers)) o.Controllers = JSON.stringify(j.Controllers).slice(0, 500);
     if (Array.isArray(j.StorageControllers)) o.StorageControllers = j.StorageControllers.map((c) => ({ Name: c.Name, Model: c.Model, Manufacturer: c.Manufacturer, Description: c.Description, SerialNumber: c.SerialNumber, FirmwareVersion: c.FirmwareVersion, Health: c.Status?.Health }));
