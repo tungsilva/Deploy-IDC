@@ -191,6 +191,10 @@ services:
       - agent_tools_data:/data/agent-tools:ro
     deploy:
       replicas: ${WORKER_REPLICAS:-7}
+    # Thời gian cho worker dừng êm khi nâng cấp: chờ lượt poll đang chạy xong
+    # (SMCIPMITool tối đa 90 s) thay vì bị SIGKILL sau 10 s mặc định — giết
+    # ngang làm phiên IPMI trên BMC không được đóng (xem apps/worker/src/main.ts).
+    stop_grace_period: 2m
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
