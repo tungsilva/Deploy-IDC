@@ -152,20 +152,29 @@ const AUDIT_IDS = new Set(['iel', 'auditlog', 'securitylog', 'sessionlog', 'mana
     console.log(`     Id=${j.Id ?? '-'}  ServiceEnabled=${j.ServiceEnabled ?? '-'}  MaxNumberOfRecords=${j.MaxNumberOfRecords ?? '-'}  OverWritePolicy=${j.OverWritePolicy ?? '-'}  Health=${j.Status?.Health ?? '-'}`);
     let next = j.Entries?.['@odata.id'];
     if (!next) { console.log('     !! log này KHÔNG có link Entries → worker trả 0 dòng'); return; }
-    const kept = []; let bare = 0, total = null, pages = 0, firstBare = null;
+    // Giống worker (từ 2026.11.20.2): log cũ-trước thì đọc tới cuối và giữ
+    // 250 dòng MỚI NHẤT; log mới-trước thì dừng khi đủ 250.
+    const kept = []; let bare = 0, total = null, pages = 0, firstBare = null, oldestFirst = null;
+    const orderKey = (m) => (m.Id !== undefined && m.Id !== '' && Number.isFinite(Number(m.Id)) ? Number(m.Id) : (Date.parse(m.Created) || null));
     while (pages < MAX_PAGES && next && !stop && gets < MAX_GETS) {
       pages++;
       const r = await get(next);
       console.log(line(next, r) + `  members=${r.j?.Members?.length ?? '-'}`);
       if (r.status !== 200 || !r.j) { console.log('     !! trang này lỗi — worker sẽ coi cả lượt là lỗi'); break; }
       if (total === null) total = r.j['Members@odata.count'] ?? null;
+      if (oldestFirst === null) {
+        const keys = (r.j.Members ?? []).map(orderKey).filter((k) => k !== null);
+        if (keys.length >= 2 && keys[0] !== keys.at(-1)) oldestFirst = keys.at(-1) > keys[0];
+      }
       for (const m of r.j.Members ?? []) {
         if (!hasContent(m)) { bare++; firstBare ??= m['@odata.id']; continue; }
-        if (kept.length < MAX_ENTRIES_PER_SERVICE) kept.push(m);
+        kept.push(m);
       }
-      if (kept.length >= MAX_ENTRIES_PER_SERVICE) { console.log(`     (worker dừng ở đây: đủ ${MAX_ENTRIES_PER_SERVICE} dòng)`); break; }
+      if (!oldestFirst && kept.length >= MAX_ENTRIES_PER_SERVICE) { kept.length = MAX_ENTRIES_PER_SERVICE; console.log(`     (worker dừng ở đây: đủ ${MAX_ENTRIES_PER_SERVICE} dòng)`); break; }
+      if (oldestFirst && kept.length > MAX_ENTRIES_PER_SERVICE) kept.splice(0, kept.length - MAX_ENTRIES_PER_SERVICE);
       next = r.j['Members@odata.nextLink'];
     }
+    console.log(`     thứ tự của BMC: ${oldestFirst === null ? 'không xác định' : oldestFirst ? 'CŨ-TRƯỚC (worker giữ 250 dòng cuối)' : 'mới-trước (worker giữ 250 dòng đầu)'}`);
     if (next && pages >= MAX_PAGES) console.log(`     (worker dừng ở ${MAX_PAGES} trang, log còn nữa)`);
     console.log(`     Members@odata.count=${total ?? '-'}  trang đã đọc=${pages}  dòng có nội dung=${kept.length}  member TRẦN (chỉ @odata.id)=${bare}`);
     if (bare > 0) {
