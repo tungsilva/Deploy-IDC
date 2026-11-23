@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Dò vì sao một máy HPE (iLO) KHÔNG có dòng SEL/IML nào và KHÔNG có RAID.
+# Dò vì sao một máy KHÔNG có dòng SEL/IML nào và KHÔNG có RAID. Viết cho HPE
+# (iLO), dùng được cho mọi máy Redfish — Supermicro, Dell.
 #
 # Đi ĐÚNG đường worker đi, từng chặng, và in ra chặng nào rơi dữ liệu:
 #   1. Hệ thống đang lưu gì cho máy này (sel_events theo nguồn, raid_*).
@@ -54,7 +55,7 @@ const WORKER_TIMEOUT_MS = 10000;
 const MAX_PAGES = 30;
 const MAX_ENTRIES_PER_SERVICE = 250;
 const MAX_LOG_SERVICES = 4;
-const AUDIT_IDS = new Set(['iel', 'auditlog', 'securitylog', 'sessionlog', 'managerlog', 'bmclog']);
+const AUDIT_IDS = new Set(['iel', 'sl', 'auditlog', 'securitylog', 'sessionlog', 'managerlog', 'bmclog']);
 
 (async () => {
   const env = process.env;
@@ -117,7 +118,13 @@ const AUDIT_IDS = new Set(['iel', 'auditlog', 'securitylog', 'sessionlog', 'mana
   const line = (p, r) => `   GET ${p} -> ${r.status}  ${r.ms} ms${r.bytes ? `  ${Math.round(r.bytes / 1024)} KB` : ''}${slow(r)}`;
   const memberRefs = (j) => (j?.Members ?? []).map((m) => m?.['@odata.id']).filter(Boolean);
   const hpe = (e) => e?.Oem?.Hpe ?? e?.Oem?.Hp;
-  const hasContent = (e) => !!(e.Message || e.Description || e.MessageId || e.Created || e.Severity || e.EntryType);
+  // Cùng luật với worker (redfish-log.service.ts): isEmptyLogEntry, MEL của
+  // Supermicro, và mô tả worker sẽ dùng (Message ?? Description ?? …) — mô tả
+  // rỗng bị tầng nạp XOÁ như rác (sel-noise.filter.ts).
+  const hasContent = (e) => !!(e.Message || e.Description || e.MessageId || e.Name || e.Created || e.Severity || e.EntryType);
+  const isMel = (e) => /MaintenanceEventLog/i.test(String(e?.Oem?.Supermicro?.['@odata.type'] ?? ''));
+  const workerText = (e) => String(e.Message ?? e.Description ?? e.MessageId ?? e.Name ?? '(no message)').trim();
+  const droppedAtIngest = (e) => ['', '(no message)'].includes(workerText(e).toLowerCase());
 
   async function readLogTree(root, label) {
     console.log(`\n== ${label}: ${root}`);
@@ -154,7 +161,7 @@ const AUDIT_IDS = new Set(['iel', 'auditlog', 'securitylog', 'sessionlog', 'mana
     if (!next) { console.log('     !! log này KHÔNG có link Entries → worker trả 0 dòng'); return; }
     // Giống worker (từ 2026.11.20.2): log cũ-trước thì đọc tới cuối và giữ
     // 250 dòng MỚI NHẤT; log mới-trước thì dừng khi đủ 250.
-    const kept = []; let bare = 0, total = null, pages = 0, firstBare = null, oldestFirst = null;
+    const kept = []; let bare = 0, mel = 0, total = null, pages = 0, lastBare = null, oldestFirst = null;
     const orderKey = (m) => (m.Id !== undefined && m.Id !== '' && Number.isFinite(Number(m.Id)) ? Number(m.Id) : (Date.parse(m.Created) || null));
     while (pages < MAX_PAGES && next && !stop && gets < MAX_GETS) {
       pages++;
@@ -167,7 +174,8 @@ const AUDIT_IDS = new Set(['iel', 'auditlog', 'securitylog', 'sessionlog', 'mana
         if (keys.length >= 2 && keys[0] !== keys.at(-1)) oldestFirst = keys.at(-1) > keys[0];
       }
       for (const m of r.j.Members ?? []) {
-        if (!hasContent(m)) { bare++; firstBare ??= m['@odata.id']; continue; }
+        if (isMel(m)) { mel++; continue; }
+        if (!hasContent(m)) { bare++; if (Number(String(m['@odata.id']).split('/').pop()) >= Number(String(lastBare ?? '').split('/').pop() || -1)) lastBare = m['@odata.id']; continue; }
         kept.push(m);
       }
       if (!oldestFirst && kept.length >= MAX_ENTRIES_PER_SERVICE) { kept.length = MAX_ENTRIES_PER_SERVICE; console.log(`     (worker dừng ở đây: đủ ${MAX_ENTRIES_PER_SERVICE} dòng)`); break; }
@@ -176,12 +184,17 @@ const AUDIT_IDS = new Set(['iel', 'auditlog', 'securitylog', 'sessionlog', 'mana
     }
     console.log(`     thứ tự của BMC: ${oldestFirst === null ? 'không xác định' : oldestFirst ? 'CŨ-TRƯỚC (worker giữ 250 dòng cuối)' : 'mới-trước (worker giữ 250 dòng đầu)'}`);
     if (next && pages >= MAX_PAGES) console.log(`     (worker dừng ở ${MAX_PAGES} trang, log còn nữa)`);
-    console.log(`     Members@odata.count=${total ?? '-'}  trang đã đọc=${pages}  dòng có nội dung=${kept.length}  member TRẦN (chỉ @odata.id)=${bare}`);
+    console.log(`     Members@odata.count=${total ?? '-'}  trang đã đọc=${pages}  dòng có nội dung=${kept.length}  member TRẦN (chỉ @odata.id)=${bare}  MEL Supermicro (worker bỏ)=${mel}`);
+    const emptyText = kept.filter(droppedAtIngest).length;
+    if (emptyText > 0) console.log(`     !! ${emptyText}/${kept.length} dòng có mô tả RỖNG theo cách worker đọc — tầng nạp XOÁ như rác.`);
     if (bare > 0) {
-      console.log(`     !! ${bare} member trần — worker coi là rác và BỎ (isEmptyLogEntry). Nếu toàn bộ log như vậy thì đây là lý do 0 dòng.`);
-      const one = await get(firstBare);
-      console.log(line(firstBare, one));
-      if (one.j) console.log(`     member đó khi GET riêng: Created=${one.j.Created ?? '-'} Severity=${one.j.Severity ?? '-'} Message=${String(one.j.Message ?? '').slice(0, 120)}`);
+      console.log(`     !! ${bare} member trần (chỉ có link). Worker từ 2026.11.23 GET riêng tối đa 30 dòng CHƯA LƯU mỗi lượt, mới nhất trước; bản cũ hơn BỎ hết → 0 dòng.`);
+      const one = await get(lastBare);
+      console.log(line(lastBare, one));
+      if (one.j) {
+        console.log(`     dòng trần MỚI NHẤT khi GET riêng: Created=${one.j.Created ?? '-'} Severity=${one.j.Severity ?? '-'} EntryCode=${one.j.EntryCode ?? '-'} Message=${String(one.j.Message ?? '').slice(0, 120)}`);
+        console.log(`     JSON thô: ${JSON.stringify(one.j).slice(0, 900)}`);
+      }
     }
     if (kept.length === 0) return;
     const created = kept.map((e) => e.Created).filter(Boolean);
@@ -194,7 +207,10 @@ const AUDIT_IDS = new Set(['iel', 'auditlog', 'securitylog', 'sessionlog', 'mana
     }
     const newest = [...kept].sort((a, b) => String(b.Created ?? '').localeCompare(String(a.Created ?? ''))).slice(0, 5);
     console.log('     5 dòng mới nhất:');
-    for (const e of newest) console.log(`       #${e.Id} ${e.Created ?? '-'} ${e.Severity ?? '-'} ${hpe(e) ? `[${hpe(e).Class}/${hpe(e).Code}] ` : ''}${String(e.Message ?? e.Description ?? '').slice(0, 140)}`);
+    for (const e of newest) console.log(`       #${e.Id} ${e.Created ?? '-'} ${e.Severity ?? '-'} ${hpe(e) ? `[${hpe(e).Class}/${hpe(e).Code}] ` : ''}${workerText(e).slice(0, 140) || '(RỖNG)'}`);
+    // Nguyên văn một dòng (log sự kiện không chứa mật khẩu) — để thấy hãng đặt
+    // nội dung vào trường nào khi Message trống.
+    console.log(`     JSON thô dòng mới nhất: ${JSON.stringify(newest[0]).slice(0, 900)}`);
   }
 
   const ping = await get('/redfish/v1');
