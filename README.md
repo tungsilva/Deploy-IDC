@@ -42,6 +42,25 @@ Lần đầu `up`, compose tự làm hết: kéo image → sinh chứng chỉ TL
   ```
 - `.env` không bao giờ bị commit (đã có trong `.gitignore`).
 
+## WAF (CrowdSec AppSec)
+
+Tuỳ chọn. Máy chủ đã chạy CrowdSec (agent) thì container web có thể hỏi AppSec của nó trước mỗi request: request mang mã khai thác đã biết (lỗ hổng CVE, `.env`, path traversal…) bị trả 403.
+
+1. Trên máy chủ, cho AppSec nghe ở IP `docker0` (container đi tới máy chủ qua IP này), rồi tạo khoá:
+   ```bash
+   cscli collections install crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-generic-rules
+   printf 'source: appsec\nlisten_addr: 172.17.0.1:7422\nappsec_config: crowdsecurity/appsec-default\nname: web-appsec\nlabels:\n  type: appsec\n' > /etc/crowdsec/acquis.d/web-appsec.yaml
+   # AppSec không mở được cổng thì CẢ CrowdSec dừng (đo trên 1.8.2) — mà docker0
+   # chỉ có sau khi Docker chạy. Bắt CrowdSec khởi động SAU Docker:
+   mkdir -p /etc/systemd/system/crowdsec.service.d
+   printf '[Unit]\nAfter=docker.service\n' > /etc/systemd/system/crowdsec.service.d/after-docker.conf
+   systemctl daemon-reload && systemctl restart crowdsec && cscli bouncers add waf-web -o raw
+   ```
+2. Trong `.env`: `CROWDSEC_APPSEC_URL=http://172.17.0.1:7422` và `CROWDSEC_APPSEC_KEY=<khoá vừa tạo>`, rồi `docker compose up -d web`.
+3. `docker compose logs web | grep crowdsec-appsec` phải ra `WAF enabled`, và `docker compose exec web wget -qO- -T 3 http://172.17.0.1:7422/ ; echo $?` phải trả về NGAY (lỗi 401 là đúng — chưa gửi khoá). Treo tới hết 3 giây là tường lửa máy chủ (ufw) chặn container: `ufw allow from 172.16.0.0/12 to 172.17.0.1 port 7422 proto tcp`. Không sửa thì WAF lặng lẽ cho qua mọi request.
+
+Giới hạn: AppSec soi phương thức, URL, tham số và header, **không soi nội dung POST** (nginx gửi request kiểm tra không kèm body). Tệp tĩnh `/assets/` không qua WAF. Cookie và header `Authorization` không được gửi sang AppSec.
+
 ## Nâng cấp
 
 ```bash

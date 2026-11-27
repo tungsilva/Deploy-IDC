@@ -229,6 +229,10 @@ services:
       # Như ở api: đổi SAN thì web được tạo lại và nạp chứng chỉ mới.
       CORE_EXTERNAL_HOST: ${CORE_EXTERNAL_HOST:?Đặt CORE_EXTERNAL_HOST trong .env}
       CERT_EXTRA_SANS: ${CERT_EXTRA_SANS:-}
+      # WAF (CrowdSec AppSec trên máy chủ). Để trống = tắt. Ví dụ
+      # CROWDSEC_APPSEC_URL=http://172.17.0.1:7422 + khoá bouncer.
+      CROWDSEC_APPSEC_URL: ${CROWDSEC_APPSEC_URL:-}
+      CROWDSEC_APPSEC_KEY: ${CROWDSEC_APPSEC_KEY:-}
     volumes:
       - certs:/etc/nginx/certs:ro
     depends_on:
