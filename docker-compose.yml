@@ -56,7 +56,11 @@ x-app: &app
 
 services:
   postgres:
-    image: timescale/timescaledb:2.29.1-pg16
+    # 2.29.3-pg16 (28-11-2026): PostgreSQL 16.16 — vá 52 CVE gồm CVE-2026-6460
+    # (thực thi mã khi có quyền tạo đối tượng; worker node ở site xa có tài
+    # khoản DB) — và TimescaleDB CVE-2026-70635. Cùng dòng 2.29, image giữ sẵn
+    # thư viện 2.29.1; service migrate tự chạy ALTER EXTENSION timescaledb UPDATE.
+    image: timescale/timescaledb:2.29.3-pg16
     logging: *logging
     restart: unless-stopped
     environment:

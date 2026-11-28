@@ -74,6 +74,8 @@ Hoặc ghim một bản cụ thể: `sed -i 's/^MH_VERSION=.*/MH_VERSION=2026.11
 
 Compose kéo image bản mới, migrate, rồi chỉ tạo lại các service ứng dụng; postgres và redis giữ nguyên. Worker node tự lên bản mới trong khoảng 2 phút.
 
+Riêng khi `docker-compose.yml` mới đổi image postgres (vd. 2026.11.28.4: `timescaledb:2.29.3-pg16` — PostgreSQL 16.16, vá CVE): `up -d` tạo lại postgres (mất kết nối CSDL ~10–30 giây, dữ liệu giữ nguyên trong volume), rồi `migrate` tự chạy `ALTER EXTENSION timescaledb UPDATE`. Luôn chạy dòng `pg_dump` ở trên trước. Kiểm sau nâng cấp: `docker compose exec postgres psql -U monitor -d monitor_hardware -Atc "show server_version; select extversion from pg_extension where extname='timescaledb'"`.
+
 Quay về bản cũ: đặt lại `MH_VERSION` cũ rồi `docker compose up -d`. Migrate chỉ thêm bảng/cột, nên bản cũ vẫn chạy được trên CSDL đã nâng.
 
 > Không chạy `docker compose down -v`: cờ `-v` xoá sạch CSDL và chứng chỉ.
