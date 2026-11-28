@@ -44,22 +44,57 @@ Lần đầu `up`, compose tự làm hết: kéo image → sinh chứng chỉ TL
 
 ## WAF (CrowdSec AppSec)
 
-Tuỳ chọn. Máy chủ đã chạy CrowdSec (agent) thì container web có thể hỏi AppSec của nó trước mỗi request: request mang mã khai thác đã biết (lỗ hổng CVE, `.env`, path traversal…) bị trả 403.
+Tuỳ chọn. Máy chủ đã chạy CrowdSec (agent) thì Monitor-Hardware hỏi AppSec của nó ở hai chỗ: nginx (container web) soi phương thức, URL, tham số và header của MỌI request; API soi thêm **body** của request ghi (POST/PUT/PATCH/DELETE). Request mang mã khai thác (chèn lệnh shell, reverse shell, SQLi, path traversal, Log4Shell, CVE đã biết…) bị trả 403.
 
-1. Trên máy chủ, cho AppSec nghe ở IP `docker0` (container đi tới máy chủ qua IP này), rồi tạo khoá:
+Bộ luật: vá ảo theo CVE + OWASP CRS đã tinh chỉnh cho Monitor-Hardware và Passbolt. Đo với CrowdSec 1.8.2 (28-11-2026): chặn 10/13 payload thử; 0 request hợp lệ bị chặn nhầm qua 11 trang giao diện và các thao tác thêm/sửa/xoá.
+
+1. Trên máy chủ, cài bộ luật và hai cấu hình (theo dõi / chặn), cho AppSec nghe ở IP `docker0` (container đi tới máy chủ qua IP này), rồi tạo khoá:
    ```bash
-   cscli collections install crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-generic-rules
-   printf 'source: appsec\nlisten_addr: 172.17.0.1:7422\nappsec_config: crowdsecurity/appsec-default\nname: web-appsec\nlabels:\n  type: appsec\n' > /etc/crowdsec/acquis.d/web-appsec.yaml
+   cscli collections install crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-generic-rules crowdsecurity/appsec-crs
+   mkdir -p /etc/crowdsec/appsec-rules /etc/crowdsec/appsec-configs
+   cat > /etc/crowdsec/appsec-rules/sitekit-crs-exclusions.yaml <<'YAML'
+   name: local/crs-site-exclusions
+   seclang_rules:
+     - SecRuleUpdateTargetById 932130 "!ARGS:json.password"
+     - SecRuleUpdateTargetById 931100 "!ARGS:json.uri"
+   YAML
+   for mode in observe block; do
+     rem=allow; [ $mode = block ] && rem=ban
+     cat > /etc/crowdsec/appsec-configs/sitekit-appsec-$mode.yaml <<YAML
+   name: local/appsec-site-$mode
+   default_remediation: $rem
+   inband_rules:
+     - crowdsecurity/base-config
+     - crowdsecurity/vpatch-*
+     - crowdsecurity/generic-*
+     - crowdsecurity/crs
+     - local/crs-site-exclusions
+   on_load:
+     - apply:
+         - RemoveInBandRuleByID(911100)
+         - RemoveInBandRuleByID(920180)
+         - RemoveInBandRuleByID(920350)
+   YAML
+   done
+   printf 'source: appsec\nlisten_addr: 172.17.0.1:7422\nappsec_config: local/appsec-site-observe\nname: web-appsec\nlabels:\n  type: appsec\n' > /etc/crowdsec/acquis.d/web-appsec.yaml
    # AppSec không mở được cổng thì CẢ CrowdSec dừng (đo trên 1.8.2) — mà docker0
    # chỉ có sau khi Docker chạy. Bắt CrowdSec khởi động SAU Docker:
    mkdir -p /etc/systemd/system/crowdsec.service.d
    printf '[Unit]\nAfter=docker.service\n' > /etc/systemd/system/crowdsec.service.d/after-docker.conf
    systemctl daemon-reload && systemctl restart crowdsec && cscli bouncers add waf-web -o raw
    ```
-2. Trong `.env`: `CROWDSEC_APPSEC_URL=http://172.17.0.1:7422` và `CROWDSEC_APPSEC_KEY=<khoá vừa tạo>`, rồi `docker compose up -d web`.
-3. `docker compose logs web | grep crowdsec-appsec` phải ra `WAF enabled`, và `docker compose exec web wget -qO- -T 3 http://172.17.0.1:7422/ ; echo $?` phải trả về NGAY (lỗi 401 là đúng — chưa gửi khoá). Treo tới hết 3 giây là tường lửa máy chủ (ufw) chặn container: `ufw allow from 172.16.0.0/12 to 172.17.0.1 port 7422 proto tcp`. Không sửa thì WAF lặng lẽ cho qua mọi request.
+   Năm luật CRS bị bỏ/thu hẹp vì bắn nhầm lưu lượng thật (đã đo): 911100 (coi PUT/PATCH/DELETE là sai), 920180 (request kiểm tra của nginx cố ý không mang body), 920350 (vào bằng IP), 932130 trên trường mật khẩu, 931100 trên trường `uri` của Passbolt (URL BMC dạng IP).
+2. Trong `.env`: `CROWDSEC_APPSEC_URL=http://172.17.0.1:7422` và `CROWDSEC_APPSEC_KEY=<khoá vừa tạo>`, rồi `docker compose up -d api web`.
+3. Kiểm:
+   - `docker compose logs web | grep crowdsec-appsec` ra `WAF enabled`; `docker compose logs api | grep CrowdSecAppSec` ra `Request bodies are checked`.
+   - `docker compose exec web wget -qO- -T 3 http://172.17.0.1:7422/ ; echo $?` phải trả về NGAY (lỗi 401 là đúng — chưa gửi khoá). Treo tới hết 3 giây là tường lửa máy chủ (ufw) chặn container: `ufw allow from 172.16.0.0/12 to 172.17.0.1 port 7422 proto tcp`. Không sửa thì WAF lặng lẽ cho qua mọi request.
+4. Chạy chế độ theo dõi (request khớp luật vẫn đi qua, chỉ ghi cảnh báo) ít nhất một tuần, xem `cscli alerts list`, rồi chuyển sang chặn:
+   ```bash
+   sed -i 's|^appsec_config: .*|appsec_config: local/appsec-site-block|' /etc/crowdsec/acquis.d/web-appsec.yaml
+   systemctl restart crowdsec
+   ```
 
-Giới hạn: AppSec soi phương thức, URL, tham số và header, **không soi nội dung POST** (nginx gửi request kiểm tra không kèm body). Tệp tĩnh `/assets/` không qua WAF. Cookie và header `Authorization` không được gửi sang AppSec.
+Hỏng thì cho qua: AppSec chết, chậm (nginx 2 giây, API 1,5 giây) hay khoá sai đều không làm sập trang. Không soi: tệp tĩnh `/assets/`, báo cáo agent (`/api/agent/*`) và endpoint của worker node (đã có xác thực token riêng; log hệ thống trong đó báo oan chắc chắn), tệp tải lên (multipart), body quá 256 KB. Cookie, header `Authorization` và giá trị các trường mật khẩu / token / OTP / secret được che trước khi gửi sang AppSec, nên không lọt vào cảnh báo của CrowdSec.
 
 ## Nâng cấp
 

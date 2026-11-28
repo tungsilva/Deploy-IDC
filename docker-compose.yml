@@ -168,6 +168,11 @@ services:
       TLS_CERT_PATH: /certs/server.crt
       TLS_KEY_PATH: /certs/server.key
       TLS_CA_PATH: /certs/ca.crt
+      # WAF cho BODY của request ghi (POST/PUT/PATCH/DELETE) — cùng AppSec và
+      # cùng khoá với service web. nginx không gửi được body sang AppSec, nên
+      # API tự gửi. Để trống = tắt.
+      CROWDSEC_APPSEC_URL: ${CROWDSEC_APPSEC_URL:-}
+      CROWDSEC_APPSEC_KEY: ${CROWDSEC_APPSEC_KEY:-}
     ports:
       # HTTPS — agent và worker node gọi vào đây.
       - "${API_BIND_ADDRESS:-0.0.0.0}:${API_PUBLISHED_PORT:-3000}:3000"
